@@ -1,0 +1,218 @@
+name: Release Helsternware Terraform CLI Packages
+# uses https://github.com/MartijnHols/actions-cache
+
+on:
+  workflow_run:
+    workflows:
+      - Build Helsternware Terraform CLI Packages
+    types: [completed]
+    branches:
+      - 'hwv[0-9]+.[0-9]+.[0-9]+*'
+  workflow_call:
+    inputs:
+      build-workflow-run:
+        type: string
+        description: the run id of the workflow that built the artifacts
+        required: true
+      release-tag:
+        type: string
+        description: the version number to be released
+        required: true
+  workflow_dispatch:
+    inputs:
+      build-workflow-run:
+        type: string
+        description: the run id of the workflow that built the artifacts
+        required: true
+      release-tag:
+        type: string
+        description: the version number to be released
+        required: true
+
+jobs:
+  normalize-inputs:
+    name: "normalize inputs"
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.normalize-inputs.outputs.should-run }}
+      build-workflow-run: ${{ steps.normalize-inputs.outputs.build-workflow-run }}
+      release-tag: ${{ steps.normalize-inputs.outputs.release-tag }}
+    steps:
+      - name: normalize inputs
+        id: normalize-inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |+
+          
+          echo "workflow_run" == "${EVENT_NAME}"
+          
+          if test "workflow_run" == "${EVENT_NAME}"
+          then
+              echo "::set-output name=build-workflow-run::${{ github.event.workflow_run.id }}"
+              echo "::set-output name=release-tag::${{ github.event.workflow_run.head_branch }}"
+          
+              if test '${{ github.event.workflow_run.conclusion }}' == 'success'
+              then
+                echo "::set-output name=should-run::yes" 
+              else
+                echo "::set-output name=should-run::no"
+              fi
+          else 
+              echo "::set-output name=should-run::yes"
+              echo "::set-output name=build-workflow-run::${{ inputs.build-workflow-run }}"
+              echo "::set-output name=release-tag::${{ inputs.release-tag }}"
+          fi      
+
+
+  prepare-release:
+    if: ${{  needs.normalize-inputs.outputs.should-run == 'yes' }}
+    name: "prepare cache"
+    runs-on: ubuntu-latest
+    outputs:
+      product-version: ${{ steps.get-versions.outputs.product-version }}
+      product-version-base: ${{ steps.get-versions.outputs.product-version-base }}
+      product-version-pre: ${{ steps.get-versions.outputs.product-version-pre }}
+    needs:
+      - normalize-inputs
+    steps:
+      - name: Decide release number
+        id: get-versions
+        shell: bash
+        env:
+          RAW_VERSION: ${{ needs.normalize-inputs.outputs.release-tag }}
+        run: |
+          
+          set -x
+          
+          # Trim the "hwv" or "v" prefix, if any.
+          if test "${RAW_VERSION#v}" == "${RAW_VERSION}"
+          then
+            VERSION="${RAW_VERSION#hwv}"
+          else
+            VERSION="${RAW_VERSION#v}"
+          fi          
+          
+          # Split off the build metadata part, if any
+          # (we won't actually include it in our final version, and handle it only for
+          # compleness against semver syntax.)
+          IFS='+' read -ra VERSION BUILD_META <<< "$VERSION"
+
+          # Separate out the prerelease part, if any
+          # (version.go expects it to be in a separate variable)
+          IFS='-' read -r BASE_VERSION PRERELEASE <<< "$VERSION"     
+          
+          echo "::set-output name=product-version::${VERSION}"
+          echo "::set-output name=product-version-base::${BASE_VERSION}"
+          echo "::set-output name=product-version-pre::${PRERELEASE}"
+
+      - name: Download artifact list
+        shell: bash
+        env:
+          RUN_ID: ${{ needs.normalize-inputs.outputs.build-workflow-run }}
+          PKG_NAME: "hw_terraform"
+          FULL_VERSION: ${{ steps.get-versions.outputs.product-version }}
+          BASE_VERSION: ${{ steps.get-versions.outputs.product-version-base }}
+          VERSION_PRERELEASE: ${{ steps.get-versions.outputs.product-version-pre }}
+        run: |+
+          
+          set -x
+
+          # create the staging directory for artifacts
+          mkdir out
+          
+          curl -fs -H 'Accept: application/vnd.github+json' https://api.github.com/repos/${{github.repository}}/actions/runs/${RUN_ID}/artifacts > ./out/artifacts.json
+          
+          # github actions has some problems parsing heredocs. this is why this command is wrapped in a subshell.
+          (cat <<H | jq --arg PKG_NAME "${{ env.PKG_NAME }}" --arg FULL_VERSION "${{ env.FULL_VERSION }}" --raw-output ' [$PKG_NAME, $FULL_VERSION, .goos, .goarch] | join("_") | . + ".zip"' > ./out/artifact_names
+          { "goos": "freebsd", "goarch": "386" }
+          { "goos": "freebsd", "goarch": "amd64" }
+          { "goos": "freebsd", "goarch": "arm" }
+          { "goos": "linux", "goarch": "386" }
+          { "goos": "linux", "goarch": "amd64" }
+          { "goos": "linux", "goarch": "arm" }
+          { "goos": "linux", "goarch": "arm64" }
+          { "goos": "openbsd", "goarch": "386" }
+          { "goos": "openbsd", "goarch": "amd64" }
+          { "goos": "solaris", "goarch": "amd64" }
+          { "goos": "windows", "goarch": "386" }
+          { "goos": "windows", "goarch": "amd64" }
+          { "goos": "darwin", "goarch": "amd64" }
+          { "goos": "darwin", "goarch": "arm64" }
+          H
+          )
+
+          # checking what's in written to file  
+          cat ./out/artifacts.json
+          
+          # checking what's been written to file  
+          cat ./out/artifact_names
+
+      - id: update-cache
+        uses: martijnhols/actions-cache/save@v3
+        with:
+          path: ./out
+          key: release-artifacts-list-${{ github.run_id }}
+
+  create-github-release:
+    if: ${{  needs.normalize-inputs.outputs.should-run == 'yes' }}
+    name: "Create github release"
+    runs-on: ubuntu-latest
+    needs:
+      - prepare-release
+      - normalize-inputs
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{needs.normalize-inputs.outputs.release-tag}}
+      - id: restore-cache
+        uses: martijnhols/actions-cache/restore@v3
+        with:
+          path: ./out
+          key: release-artifacts-list-${{ github.run_id }}
+      - name: download artifacts
+        shell: bash
+        run: |+
+          
+          set -x
+          
+          # create the staging directory for artifacts
+          ls -alh ./out
+          
+          # checking what's in written to file  
+          # cat ./out/artifacts.json
+          
+          # checking what's been written to file  
+          cat ./out/artifact_names          
+          
+          jq < ./out/artifacts.json
+          
+          # build the list of curl params
+          while read NAME
+          do        
+            jq --arg name "${NAME}" --raw-output '.artifacts[] | select(.name == $name) | [ "./out/" + $name, .archive_download_url] | @tsv' < ./out/artifacts.json | tee --append ./out/curl_params              
+          done < ./out/artifact_names
+          
+          # let's see the params
+          cat ./out/curl_params
+          
+          # create the staging directory for artifacts
+          ls -alh ./out
+          
+          # download up 5 assets concurrently
+          xargs --verbose -n 2 --max-procs 5 --arg-file ./out/curl_params bash -c 'curl -H "Authorization: Bearer ${{secrets.GITHUB_TOKEN}}" -fL -o $0 $1'
+          
+          # create the staging directory for artifacts
+          ls -alh ./out
+
+      - name: Create Github Release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          prerelease: ${{ needs.prepare-release.outputs.product-version-pre   != '' }}
+          name: Release ${{needs.normalize-inputs.outputs.release-tag}}
+          tag_name: ${{needs.normalize-inputs.outputs.release-tag}}
+          body_path: ${{ github.workspace }}/CHANGELOG.helsternware.md
+          files: |
+            ${{ github.workspace }}/out/hw_terraform_*.zip          
+          
